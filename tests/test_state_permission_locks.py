@@ -53,11 +53,11 @@ def test_hardening_keeps_files_private_and_refuses_symlink_targets(tmp_path, suf
     if sidecar.exists():
         sidecar.unlink()
     target = tmp_path / "unrelated-file"
-    target.write_text("keep this private test content unchanged")
+    target.write_text("keep this private test content unchanged", encoding="utf-8")
     target.chmod(0o644)
     sidecar.symlink_to(target)
     with pytest.raises(OSError) as error:
         _secure_state_db_files(path, create_main=True)
     assert error.value.errno == errno.ELOOP
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
-    assert target.read_text() == "keep this private test content unchanged"
+    assert target.read_text(encoding="utf-8") == "keep this private test content unchanged"
