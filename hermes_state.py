@@ -7,6 +7,7 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+import errno
 import hashlib
 import json
 import logging
@@ -15,6 +16,7 @@ import queue
 import random
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -230,6 +232,7 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
     if os.name == "nt":
         return
 
+    path_only = sys.platform.startswith("linux") and hasattr(os, "O_PATH")
     for index, path in enumerate(
         (
             db_path,
@@ -237,13 +240,26 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
             db_path.with_name(db_path.name + "-shm"),
         )
     ):
-        flags = os.O_RDONLY
-        if index == 0 and create_main:
+        # A normal open/fchmod/close drops this process's SQLite POSIX locks.
+        # O_PATH pins the inode without participating in those locks.
+        flags = os.O_PATH if path_only else os.O_RDONLY
+        if index == 0 and create_main and not path_only:
             flags = os.O_WRONLY | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
+        if path_only and index == 0 and create_main:
+            try:
+                created = os.open(
+                    path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            else:
+                # Only a newly created inode is closed, before SQLite opens it.
+                os.close(created)
         try:
             fd = os.open(path, flags, 0o600)
         except FileNotFoundError:
@@ -253,7 +269,18 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
             # canonical error for this, and a directory leaks no row data.
             continue
         try:
-            os.fchmod(fd, 0o600)
+            if path_only:
+                mode = os.fstat(fd).st_mode
+                if stat.S_ISDIR(mode):
+                    continue
+                if stat.S_ISLNK(mode):
+                    raise OSError(errno.ELOOP, "Refusing a symlink database file", str(path))
+                if not stat.S_ISREG(mode):
+                    raise OSError(errno.EINVAL, "Database file is not regular", str(path))
+                # fchmod rejects O_PATH; procfs resolves this exact pinned inode.
+                os.chmod(f"/proc/self/fd/{fd}", 0o600)
+            else:
+                os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
 
